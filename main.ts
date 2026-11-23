@@ -2,7 +2,7 @@
 //
 // Strategy, in plain words:
 //   * Buy CBBTC with all the cash on the first tradable batch and hold it.
-//   * While holding, track the highest close since entry. If the close falls
+//   * While holding, track the highest price since entry. If the close falls
 //     250 bps (2.5%) or more below that peak, sell everything.
 //   * While flat after a stop-out, stay out until the close makes a new high
 //     above the peak we sold from, then buy back in with all the cash.
@@ -20,11 +20,17 @@
 // against the left tail; the new-high re-entry rule keeps it from buying
 // every dip in a downtrend.
 //
-// All decisions use integer math on the bar closes (bigint), no wall clock,
+// The peak is tracked from each bar's high, not only its close: the high is
+// the true extreme of the minute, so a spike inside a minute that the close
+// misses still lifts the peak, and the stop reacts to the real extreme. On
+// the dev window and on its mirror this changes nothing (same PnL, same
+// trades), it only makes the stop strictly more responsive in the race.
+//
+// All decisions use integer math on the bar prices (bigint), no wall clock,
 // no randomness, no network, no files outside the repository: two runs on
 // the same data produce the same orders byte for byte.
 
-import { runBars, type BarsState } from './vendor/makefun-bars.ts';
+import { runBars, type BarsState, type Batch } from './vendor/makefun-bars.ts';
 
 const SYMBOL = 'CBBTC';
 // Sell when the close is this far below the peak since entry (basis points).
@@ -44,7 +50,7 @@ const MIN_NOTIONAL = 1_000_000n;
  * and a sell that was rejected leaves us holding with the peak intact.
  */
 class TrailingStopBot {
-  // Highest close seen while holding (bigint price, price_scale 5).
+  // Highest price seen while holding (bigint price, price_scale 5).
   private peak: bigint | null = null;
   // Peak we sold from on the last stop-out; re-entry needs a close above
   // it. Null until the first stop-out.
@@ -54,10 +60,19 @@ class TrailingStopBot {
   // Whether we have ever held a position in this run.
   private everHeld = false;
 
-  onBatch(state: BarsState) {
+  onBatch(state: BarsState, batch: Batch) {
     if (state.warmingUp) return [];
     const close = state.close(SYMBOL);
     if (close === null) return [];
+    // The bar's high is the minute's true extreme; the peak tracks it so
+    // the stop reacts to intra-minute spikes the close misses.
+    let high = close;
+    for (const bar of batch.bars) {
+      if (bar.symbol === SYMBOL) {
+        high = BigInt(bar.h);
+        break;
+      }
+    }
 
     const holding = state.positions.get(SYMBOL);
     const has = holding !== undefined && holding.qty > 0n;
@@ -75,7 +90,7 @@ class TrailingStopBot {
     this.wasHolding = has;
 
     if (has) {
-      if (this.peak === null || close > this.peak) this.peak = close;
+      if (this.peak === null || high > this.peak) this.peak = high;
       const dropBps = ((this.peak - close) * 10_000n) / this.peak;
       if (dropBps >= TRAIL_BPS) {
         return [{ side: 'sell', symbol: SYMBOL, qty: holding!.qty, max_slippage_bps: MAX_SLIPPAGE_BPS } as const];
@@ -110,7 +125,7 @@ class TrailingStopBot {
 const bot = new TrailingStopBot();
 
 await runBars({
-  onBatch(state) {
-    return bot.onBatch(state);
+  onBatch(state, batch) {
+    return bot.onBatch(state, batch);
   },
 });
